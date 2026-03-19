@@ -1,4 +1,5 @@
 import random
+import csv
 from pathlib import Path
 
 from genedesign.rbs_chooser import RBSChooser
@@ -12,15 +13,11 @@ from genedesign.checkers.RNAaseEChecker import RNAseEChecker
 
 class TranscriptDesigner:
     """
-    Reverse translates a protein sequence into a DNA sequence using the
-    GeneOptimizer sliding-window algorithm, then selects an RBS.
+    Reverse translates a protein sequence into a DNA sequence using a
+    sliding-window algorithm with guided random codon sampling.
 
-    Algorithm (per the GeneOptimizer paper, PMID 21189842):
-      1. Break the sequence into 3-aa windows (9 nt each), scan left to right.
-      2. For each window, enumerate all synonymous codon combinations and score
-         each in context of: upstream preamble (3 committed codons) + current
-         3 codons + next 6 aa's (downstream lookahead from seed).
-      3. Commit the best-scoring 3 codons and slide forward.
+    For each 3-aa window, sample a limited number of RSCU-weighted codon
+    combinations and keep the best one in context.
     """
 
     def __init__(self):
@@ -29,35 +26,33 @@ class TranscriptDesigner:
         self.codonChecker = None
         self.forbiddenSequenceChecker = None
         self.promoterChecker = None
-        self.rnaseEchecker = None
-        self.codonFrequencies = {}
-        self.codonChoices = {}
+        self.rnaseEChecker = None
+        self.aaToSynonymousCodons = {}
+        self.aaToWeights = {}
+
         self.commitCodonsPerStep = 3
         self.downstreamLookaheadCodons = 6
-        self.preambleCodons = 8  # 24 nt upstream context — keeps window ≥ 50 nt for hairpin checker
-        self.maxTrialsPerWindow = 100
+        self.preambleCodons = 8
+        # Needs to be 51 for hairpin checker
+        # Main speed/quality knob
+        self.samplesPerWindow = 20
 
     def initiate(self) -> None:
-        """
-        Initializes the codon table and the RBS chooser.
-        """
         self.rbsChooser = RBSChooser()
         self.rbsChooser.initiate()
+
         self.codonChecker = CodonChecker()
         self.codonChecker.initiate()
+
         self.forbiddenSequenceChecker = ForbiddenSequenceChecker()
         self.forbiddenSequenceChecker.initiate()
+
         self.promoterChecker = PromoterChecker()
         self.promoterChecker.initiate()
-        self.codonFrequencies = self._load_amino_acid_codon_frequencies()
-        self.rnaseEchecker = RNAseEChecker()
-        self.codonChoices = {
-            aa: (tuple(freqs.keys()), tuple(freqs.values()))
-            for aa, freqs in self.codonFrequencies.items()
-        }
 
+        self.rnaseEChecker = RNAseEChecker()
 
-        # Highest-CAI codon for each amino acid (E. coli)
+        # Highest-CAI seed codon for each amino acid
         self.aminoAcidToCodon = {
             'A': "GCG", 'C': "TGC", 'D': "GAT", 'E': "GAA", 'F': "TTC",
             'G': "GGT", 'H': "CAC", 'I': "ATC", 'K': "AAA", 'L': "CTG",
@@ -65,141 +60,130 @@ class TranscriptDesigner:
             'S': "TCT", 'T': "ACC", 'V': "GTT", 'W': "TGG", 'Y': "TAC"
         }
 
-    def _initialize_codons_highest_cai(self, peptide: str) -> list[str]:
-        return [self.aminoAcidToCodon[aa] for aa in peptide]
-
-    def _load_amino_acid_codon_frequencies(self) -> dict[str, dict[str, float]]:
-        """
-        Returns a codon frequency table in the form:
-        {amino_acid: {codon: relative_frequency}}
-        """
         codon_usage_path = Path(__file__).resolve().parent / "data" / "codon_usage.txt"
-        freq_table: dict[str, dict[str, float]] = {}
+        aa_codon_freq = {}
 
-        with codon_usage_path.open("r") as handle:
-            for line in handle:
-                parts = line.split()
-                if len(parts) < 3:
+        with open(codon_usage_path, "r") as f:
+            reader = csv.reader(f, delimiter='\t')
+            for row in reader:
+                if len(row) < 3:
                     continue
 
-                codon = parts[0].strip()
-                aa = parts[1].strip()
+                codon = row[0].strip().upper()
+                aa = row[1].strip()
+
                 try:
-                    rel_freq = float(parts[2])
+                    freq = float(row[2].strip())
                 except ValueError:
                     continue
 
-                if aa not in freq_table:
-                    freq_table[aa] = {}
-                freq_table[aa][codon] = rel_freq
+                if aa == '*':
+                    continue
 
-        return freq_table
+                aa_codon_freq.setdefault(aa, []).append((codon, freq))
 
-    def _score_window(self, codons: list[str], cutoff: float | None = None) -> float:
-        """
-        Scores a codon window. Lower is better (0.0 = fully passing).
-        """
-        local_dna = ''.join(codons)
-        score = 0.0
+        for aa, codon_freqs in aa_codon_freq.items():
+            self.aaToSynonymousCodons[aa] = [cf[0] for cf in codon_freqs]
+            self.aaToWeights[aa] = [cf[1] for cf in codon_freqs]
 
-        passes, _, _, _ = self.codonChecker.run(codons)
-        if not passes:
-            score += 1.0
+    def _initialize_codons_highest_cai(self, peptide: str) -> list[str]:
+        return [self.aminoAcidToCodon[aa] for aa in peptide]
 
-        passes, _ = self.rnaseEchecker.run(local_dna)
-        if not passes:
-            score += 1.0
+    def _sample_commit(self, window_aas: str) -> list[str]:
+        return [
+            random.choices(
+                self.aaToSynonymousCodons[aa],
+                weights=self.aaToWeights[aa],
+                k=1
+            )[0].upper()
+            for aa in window_aas
+        ]
 
-        passes, _ = self.forbiddenSequenceChecker.run(local_dna)
-        if not passes:
-            score += 1.0
+    def _score(self, coding_codons: list[str], dna_context_codons: list[str]) -> int:
+        coding_codons = [c.upper() for c in coding_codons]
+        dna = "".join(c.upper() for c in dna_context_codons)
 
-        passes, _ = self.promoterChecker.run(local_dna)
-        if not passes:
-            score += 1.0
+        score = 0
 
-
-        passes, _ = hairpin_checker(local_dna)
-        if not passes:
-            score += 1.0
+        if not self.codonChecker.run(coding_codons)[0]:
+            score += 1
+        if not self.forbiddenSequenceChecker.run(dna)[0]:
+            score += 1
+        if not self.promoterChecker.run(dna)[0]:
+            score += 1
+        if not self.rnaseEChecker.run(dna)[0]:
+            score += 1
+        if not hairpin_checker(dna)[0]:
+            score += 1
 
         return score
 
-    def _optimize_tiled_windows(self, peptide: str, seed_codons: list[str], utr: str) -> list[str]:
-        """
-        GeneOptimizer-style rolling window optimization:
-          - Prepends UTR (split into 3-nt chunks) so early windows can look back into it.
-          - Iterates over CDS codons only; preamble reaches into UTR chunks when near the start.
-          - Commits the best 3-codon block per window and advances by 3.
-        """
-        # Split UTR into 3-nt chunks (trim front so length is a multiple of 3)
-        utr_trimmed = utr.upper()[len(utr) % 3:]
-        utr_chunks = [utr_trimmed[i:i+3] for i in range(0, len(utr_trimmed), 3)]
-        utr_offset = len(utr_chunks)
-
-        # Full working sequence: UTR chunks + CDS seed codons
-        final_codons = utr_chunks + seed_codons.copy()
+    def _optimize(self, peptide: str, seed_codons: list[str], utr: str) -> list[str]:
         n = len(peptide)
         step = self.commitCodonsPerStep
+        final_codons = [c.upper() for c in seed_codons]
+        utr = utr.upper()
 
-        for i in range(utr_offset, utr_offset + n, step):
-            commit_end = min(utr_offset + n, i + step)
-            lookahead_end = min(utr_offset + n, commit_end + self.downstreamLookaheadCodons)
+        for i in range(0, n, step):
+            commit_end = min(n, i + step)
+            lookahead_end = min(n, commit_end + self.downstreamLookaheadCodons)
+
             preamble_start = max(0, i - self.preambleCodons)
-
             preamble = final_codons[preamble_start:i]
+
+            if i < self.preambleCodons:
+                missing = self.preambleCodons - len(preamble)
+                utr_tail = utr[-3 * missing:] if missing > 0 else ""
+                utr_chunks = [utr_tail[j:j + 3] for j in range(0, len(utr_tail), 3)]
+                preamble = utr_chunks + preamble
+
+            current_commit = final_codons[i:commit_end]
             lookahead = final_codons[commit_end:lookahead_end]
-            amino_commit = peptide[i - utr_offset:commit_end - utr_offset]
+            window_aas = peptide[i:commit_end]
 
-            best_commit = list(final_codons[i:commit_end])
-            best_score = self._score_window(preamble + best_commit + lookahead)
+            best_commit = current_commit[:]
+            best_score = self._score(
+                coding_codons=current_commit + lookahead,
+                dna_context_codons=preamble + current_commit + lookahead
+            )
 
-            for _ in range(self.maxTrialsPerWindow):
-                if best_score == 0.0:
-                    break
-                trial_commit = []
-                for aa in amino_commit:
-                    choices, weights = self.codonChoices[aa]
-                    trial_commit.append(random.choices(choices, weights=weights, k=1)[0])
+            for _ in range(self.samplesPerWindow):
+                trial_commit = self._sample_commit(window_aas)
 
-                trial_score = self._score_window(
-                    preamble + trial_commit + lookahead,
-                    cutoff=best_score
+                trial_score = self._score(
+                    coding_codons=trial_commit + lookahead,
+                    dna_context_codons=preamble + trial_commit + lookahead
                 )
+
                 if trial_score < best_score:
                     best_score = trial_score
                     best_commit = trial_commit
 
+                    if best_score == 0:
+                        break
+
             final_codons[i:commit_end] = best_commit
 
-        # Return only the CDS part (strip UTR chunks)
-        return final_codons[utr_offset:]
+        return final_codons
 
     def run(self, peptide: str, ignores: set) -> Transcript:
-        """
-        Translates the peptide sequence to DNA and selects an RBS.
-
-        Parameters:
-            peptide (str): The protein sequence to translate.
-            ignores (set): RBS options to ignore.
-
-        Returns:
-            Transcript: The transcript with the selected RBS and codon list.
-        """
+        # deterministic high-CAI seed is fine and fast
         seed_codons = self._initialize_codons_highest_cai(peptide)
-        initialRBS = self.rbsChooser.run(seed_codons, ignores)
-        utr = initialRBS.utr
 
-        cds = self._optimize_tiled_windows(peptide, seed_codons, utr)
+        selected_rbs = self.rbsChooser.run(seed_codons, ignores)
+        utr = selected_rbs.utr.upper()
+
+        cds = self._optimize(peptide, seed_codons, utr)
         cds.append("TAA")
 
-        selectedRBS = self.rbsChooser.run(cds, ignores)
-        return Transcript(selectedRBS, peptide, cds)
+        return Transcript(selected_rbs, peptide, cds)
 
 
 def main() -> None:
-    """Run a small example transcript design and print key outputs."""
-    peptide = "MNPSDVFQIIEGHTKLMRDSIPLIASENLTSLSVRRCYVSDLGHRYAEGRVGERFYEGCKYVDQIESMAIELTRKIFEAEHANVQPISGVVANLAAFFALTNVGDTIMSISVPCGGHISHDRVSAAGLRGLRVIHYPFNSEEMSVDVDETRKVAERERPKLFILGSTLILFRQPVKEIREIADEIGAYVMYDASHVLGLIAGKAFQNPLKEGADVMTGSTHKTFFGPQRAIIASRKELAEKVDRAVFPGVVSNHHLNTLAGYVVAAMEMLEFGEDYAKQVVRNAKALAEELYSLGYKVLGEKRGFTETHQVAVDVREFGGGERVAKVLENAGIILNKNLLPWDSLEKTANPSGIRIGVQEVTRIGMKEEEMRAIAEIMDAAIKEKKSVDELRNEVKELKERFNVIKYSFDESEAYHFPDLR"
+    peptide = (
+        "MNPSDVFQIIEGHTKLMRDSIPLIASENLTSLSVRRCYVSDLGHRYAEGRVGERFYEGCKYVDQIESMAIELTRK"
+        "IFEAEHANVQPISGVVANLAAFFALTNVGDTIMSISVPCGGHISHDRVSAAGLRGLRVIHYPFNSEEMSVDVDETR"
+    )
 
     designer = TranscriptDesigner()
     designer.initiate()
@@ -208,11 +192,10 @@ def main() -> None:
     cds = "".join(transcript.codons)
     full_seq = transcript.rbs.utr.upper() + cds
 
-    print("Peptide:", peptide)
     print("Selected RBS:", transcript.rbs.gene_name)
-    print("UTR length:", len(transcript.rbs.utr))
     print("CDS length:", len(cds))
     print("Total transcript length:", len(full_seq))
+
 
 if __name__ == "__main__":
     main()
